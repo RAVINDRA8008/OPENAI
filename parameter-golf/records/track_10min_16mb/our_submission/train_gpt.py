@@ -1019,10 +1019,11 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             
-            # EMA Swap for validation via deepcopy (keeps optim stats intact)
-            import copy
-            backup_state = copy.deepcopy(base_model.state_dict())
-            base_model.load_state_dict(ema_state, strict=True)
+            # Instant memory-free EMA pointer swap
+            train_state_cache = {}
+            for k, v in base_model.state_dict().items():
+                train_state_cache[k] = v.data
+                v.data = ema_state[k]
             
             val_loss, val_bpb = eval_val(
                 args,
@@ -1037,7 +1038,8 @@ def main() -> None:
                 is_boundary_token_lut,
             )
             
-            base_model.load_state_dict(backup_state, strict=True)
+            for k, v in base_model.state_dict().items():
+                v.data = train_state_cache[k]
             
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
