@@ -68,6 +68,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -249,28 +250,33 @@ def eval_val(
     model.eval()
     with torch.inference_mode():
         stride = 64
-        for batch_seq_start in range(seq_start, seq_end - 1, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end - 1)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss_unreduced = model(x, y, reduction="none").detach()
-            
-            loss_stride = loss_unreduced.view(-1, args.train_seq_len)[:, -stride:]
-            batch_loss = loss_stride.sum()
-            batch_token_count = float(loss_stride.numel())
-            
-            val_loss_sum += batch_loss.to(torch.float64)
-            val_token_count += batch_token_count
-            
-            prev_ids = x[:, -stride:].reshape(-1)
-            tgt_ids = y[:, -stride:].reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+        seq_len = args.train_seq_len
+        raw_start = seq_start * seq_len
+        raw_end = seq_end * seq_len
+        
+        local_tokens = val_tokens[raw_start : raw_end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+        # Handle cases where rank slice is smaller than seq_len
+        if local_tokens.size(0) > seq_len:
+            windows = local_tokens.unfold(0, seq_len + 1, stride)
+            for i in range(0, windows.size(0), local_batch_seqs):
+                batch_windows = windows[i : i + local_batch_seqs]
+                x = batch_windows[:, :-1]
+                y = batch_windows[:, 1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss_unreduced = model(x, y, reduction="none").detach()
+                
+                loss_stride = loss_unreduced[:, -stride:]
+                batch_loss = loss_stride.sum()
+                batch_token_count = float(loss_stride.numel())
+                
+                val_loss_sum += batch_loss.to(torch.float64)
+                val_token_count += batch_token_count
+                
+                prev_ids = x[:, -stride:].reshape(-1)
+                tgt_ids = y[:, -stride:].reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -576,9 +582,10 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 16,
     ):
         super().__init__()
-        self.rope_dims = 16
+        self.rope_dims = rope_dims
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
@@ -647,7 +654,8 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -735,7 +743,12 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            w = self.tok_emb.weight
+            if self.training:
+                # Per-channel Fake QAT for tied embeddings
+                scale = (w.abs().amax(dim=1, keepdim=True) / 31.0).clamp_min(1e-12)
+                w = (w / scale).round().clamp(-31.0, 31.0) * scale
+            logits_proj = F.linear(x, w)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -1001,8 +1014,9 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             
-            # EMA Swap for validation
-            train_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+            # EMA Swap for validation via deepcopy (keeps optim stats intact)
+            import copy
+            backup_state = copy.deepcopy(base_model.state_dict())
             base_model.load_state_dict(ema_state, strict=True)
             
             val_loss, val_bpb = eval_val(
@@ -1018,7 +1032,7 @@ def main() -> None:
                 is_boundary_token_lut,
             )
             
-            base_model.load_state_dict(train_state, strict=True)
+            base_model.load_state_dict(backup_state, strict=True)
             
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
